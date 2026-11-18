@@ -2,12 +2,19 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="La Luna">
+<meta name="theme-color" content="#0d1220">
+<link rel="apple-touch-icon" href="icon.png">
 <title>La Luna AR</title>
 <style>
   :root { --bg: #0d1220; --ink: #f4f1e8; --accent: #ffd34d; --ring: #6fe3ff; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden;
-    font: 18px/1.35 ui-rounded, "SF Pro Rounded", system-ui, sans-serif; -webkit-user-select: none; user-select: none; }
+    font: 18px/1.35 ui-rounded, "SF Pro Rounded", system-ui, sans-serif; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; touch-action: manipulation; overscroll-behavior: none; }
   #stage { position: fixed; inset: 0; }
   #start { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px;
     background: radial-gradient(circle at 50% 40%, #1d2a4a, var(--bg)); z-index: 10; }
@@ -56,45 +63,249 @@ const DEMO = new URLSearchParams(location.search).has("demo");
 const data = await (await fetch("features.json")).json();
 const $ = id => document.getElementById(id);
 
-// ---------- voice (Spanish) ----------
-let voice = null;
-function pickVoice() {
-  const vs = speechSynthesis.getVoices().filter(v => v.lang.toLowerCase().startsWith("es"));
-  const pref = ["es-VE", "es-419", "es-US", "es-MX", "es-CO", "es-ES"];
-  const odd = /eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley|bad|bahh|bells|boing|bubbles|cellos|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|fred|junior|kathy|ralph/i;
-  const nice = vs.filter(v => !odd.test(v.name));
-  const named = ["Paulina", "Mónica", "Monica", "Google español de Estados Unidos", "Google español"]
-    .map(n => nice.find(v => v.name.startsWith(n))).find(Boolean);
-  voice = named || pref.map(p => nice.find(v => v.lang.replace("_", "-") === p)).find(Boolean) || nice[0] || vs[0] || null;
-}
-pickVoice();
-speechSynthesis.onvoiceschanged = pickVoice;
-function say(text) {
-  speechSynthesis.cancel();
+// ---------- voice: pre-recorded Spanish (Paulina), browser voice only as a fallback ----------
+const player = new Audio();
+player.preload = "auto";
+function speakFallback(text) {
+  if (!("speechSynthesis" in window)) return;
+  const vs = speechSynthesis.getVoices().filter(v => /^es/i.test(v.lang));
+  const v = vs.find(v => /Paulina|Mónica|Monica/.test(v.name)) || vs.find(v => /es.(MX|US|419)/i.test(v.lang)) || vs[0];
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = voice ? voice.lang : "es-ES";
-  if (voice) u.voice = voice;
-  u.rate = 0.92; u.pitch = 1.08;
-  speechSynthesis.speak(u);
+  u.lang = v ? v.lang : "es-MX"; if (v) u.voice = v;
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
+function play(key, text) {
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  player.pause();
+  player.src = `audio/${key}.m4a`;
+  player.currentTime = 0;
+  player.play().catch(() => speakFallback(text));
+}
+function hush() { player.pause(); if ("speechSynthesis" in window) speechSynthesis.cancel(); }
+
+// ---------- helpers ----------
+const K = data.moon.r / 1737.4;                         // anchor units per km
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const ease = x => 1 - Math.pow(1 - clamp01(x), 3);
+const flat = (c, o = {}) => new THREE.MeshBasicMaterial({ color: c, transparent: true, depthTest: false, side: THREE.DoubleSide, ...o });
+const solid = c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.7, metalness: 0.15 });
+const upCone = (r, segs = 8) => { const g = new THREE.ConeGeometry(r, 1, segs); g.rotateX(Math.PI / 2); g.translate(0, 0, 0.5); return g; };
+function label(text, h = 0.02) {
+  const c = document.createElement("canvas"); const x = c.getContext("2d");
+  x.font = "bold 64px ui-rounded, system-ui, sans-serif";
+  c.width = Math.ceil(x.measureText(text).width) + 40; c.height = 96;
+  x.font = "bold 64px ui-rounded, system-ui, sans-serif";
+  x.fillStyle = "rgba(13,18,32,.85)"; x.beginPath(); x.roundRect(0, 0, c.width, c.height, 40); x.fill();
+  x.fillStyle = "#ffd34d"; x.textBaseline = "middle"; x.fillText(text, 20, 50);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  s.scale.set(h * c.width / c.height, h, 1); s.renderOrder = 10;
+  return s;
 }
 
 // ---------- the content pinned to the drawing ----------
 const content = new THREE.Group();
+content.add(new THREE.AmbientLight(0xffffff, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2); sun.position.set(0.4, -0.6, 1); content.add(sun);
 const marks = [];
-for (const f of data.features) {
+data.features.forEach((f, i) => {
   const g = new THREE.Group();
   g.position.set(f.pos[0], f.pos[1], 0.002);
   const r = Math.max(f.r, 0.012);
-  const ring = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.004, 48),
-    new THREE.MeshBasicMaterial({ color: 0x6fe3ff, transparent: true, opacity: 0.95, depthTest: false }));
-  const glow = new THREE.Mesh(new THREE.CircleGeometry(r + 0.012, 48),
-    new THREE.MeshBasicMaterial({ color: 0x6fe3ff, transparent: true, opacity: 0.18, depthTest: false }));
-  const hit = new THREE.Mesh(new THREE.CircleGeometry(Math.max(r + 0.02, 0.035), 24),
-    new THREE.MeshBasicMaterial({ visible: false }));
-  hit.userData.f = f;
+  const ring = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.004, 48), flat(0x6fe3ff, { opacity: 0.95 }));
+  const glow = new THREE.Mesh(new THREE.CircleGeometry(r + 0.012, 48), flat(0x6fe3ff, { opacity: 0.18 }));
+  const hit = new THREE.Mesh(new THREE.CircleGeometry(Math.max(r + 0.02, 0.035), 24), new THREE.MeshBasicMaterial({ visible: false }));
   g.add(glow, ring, hit);
   content.add(g);
-  marks.push({ f, g, ring, glow, hit, phase: Math.random() * 6.28 });
+  marks.push({ f, i, g, ring, glow, hit, phase: Math.random() * 6.28 });
+});
+
+// ---------- animations: one short scene per feature ----------
+const FX = {
+  "MAR DE LAS LLUVIAS": f => {            // a giant rock hits, the hole fills with lava, the lava cools
+    const g = new THREE.Group(), R = f.km * K;
+    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.014), solid(0x8a7f74));
+    const flash = new THREE.Mesh(new THREE.CircleGeometry(1, 48), flat(0xffffff, { opacity: 0 }));
+    const shock = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 64), flat(0xffe0a0, { opacity: 0 }));
+    const lava = new THREE.Mesh(new THREE.CircleGeometry(1, 64), flat(0xff6a1a, { opacity: 0 }));
+    g.add(lava, shock, flash, rock);
+    const from = new THREE.Vector3(R * 2.4, R * 2.8, 0.4), to = new THREE.Vector3(), hot = new THREE.Color(0xff6a1a), cold = new THREE.Color(0x4a4440);
+    return { g, update(t) {
+      if (t < 1.2) { rock.position.lerpVectors(from, to, (t / 1.2) ** 2); rock.rotation.x += 0.2; rock.rotation.y += 0.13; } else rock.visible = false;
+      const u = t - 1.2;
+      if (u > 0) {
+        flash.material.opacity = clamp01(1 - u / 0.5); flash.scale.setScalar(R * 0.35 * (1 + u * 3));
+        shock.material.opacity = clamp01(1 - u / 1.3); shock.scale.setScalar(Math.max(1e-4, R * 1.15 * ease(u / 1.3)));
+        const lf = clamp01((u - 0.8) / 2.4);
+        lava.scale.setScalar(Math.max(1e-4, R * ease(lf)));
+        lava.material.opacity = 0.8 * lf * clamp01((9.5 - u) / 1.5);
+        lava.material.color.lerpColors(hot, cold, clamp01((u - 3.5) / 3));
+      }
+      return t < 11;
+    } };
+  },
+  "OCÉANO DE LAS TORMENTAS": f => {       // rain falls... and dries up: it's lava, not water
+    const g = new THREE.Group(), R = Math.min(f.km * K, 0.07);
+    const drops = Array.from({ length: 9 }, (_, i) => {
+      const d = new THREE.Mesh(new THREE.SphereGeometry(0.006, 14, 10), solid(0x4fb4ff));
+      d.userData = { x: (Math.random() - 0.5) * R * 1.6, y: (Math.random() - 0.5) * R * 1.6, d: i * 0.28 };
+      d.visible = false; g.add(d); return d;
+    });
+    const rings = [0, 1, 2].map(() => { const r = new THREE.Mesh(new THREE.RingGeometry(0.93, 1, 64), flat(0xff8a3d, { opacity: 0 })); g.add(r); return r; });
+    const no = label("¡sin agua!", 0.022); no.position.set(0, 0, 0.05); no.visible = false; g.add(no);
+    return { g, update(t) {
+      for (const d of drops) {
+        const u = t - d.userData.d; d.visible = u > 0 && u < 1.5;
+        d.position.set(d.userData.x, d.userData.y, Math.max(0, 0.25 * (1 - u)));
+        d.scale.setScalar(u < 1 ? 1 : Math.max(0.01, 1 - (u - 1) / 0.5));
+      }
+      no.visible = t > 3 && t < 9;
+      rings.forEach((r, i) => { const p = ((t - 3.2 - i * 0.8) % 2.4) / 2.4; const on = t > 3.2 + i * 0.8 && t < 9.5;
+        r.scale.setScalar(Math.max(1e-4, R * p)); r.material.opacity = on ? (1 - p) * 0.8 : 0; });
+      return t < 10;
+    } };
+  },
+  "ARISTARCO": () => {                    // the brightest spot sparkles
+    const g = new THREE.Group(), star = new THREE.Group();
+    [[0.07, 0.006, 0], [0.07, 0.006, Math.PI / 2], [0.04, 0.004, Math.PI / 4], [0.04, 0.004, -Math.PI / 4]].forEach(([w, h, a]) => {
+      const p = new THREE.Mesh(new THREE.PlaneGeometry(w, h), flat(0xfff6c8)); p.rotation.z = a; star.add(p); });
+    star.add(new THREE.Mesh(new THREE.CircleGeometry(0.009, 24), flat(0xffffff)));
+    const tw = Array.from({ length: 7 }, (_, i) => { const s = new THREE.Mesh(new THREE.CircleGeometry(0.003, 12), flat(0xffffff));
+      const a = i / 7 * 6.28, d = 0.03 + Math.random() * 0.03; s.position.set(Math.cos(a) * d, Math.sin(a) * d, 0.003); s.userData.p = Math.random() * 6; g.add(s); return s; });
+    star.position.z = 0.004; g.add(star);
+    return { g, update(t) {
+      const fade = t > 6 ? clamp01(7 - t) : 1;
+      star.scale.setScalar(Math.max(1e-4, ease(t / 0.4) * (1 + 0.25 * Math.sin(t * 8)) * fade)); star.rotation.z = t * 0.7;
+      for (const s of tw) s.material.opacity = fade * (0.5 + 0.5 * Math.sin(t * 6 + s.userData.p));
+      return t < 7;
+    } };
+  },
+  "COPÉRNICO": () => {                    // a whole city fits inside the crater
+    const g = new THREE.Group(), R = 0.024;
+    g.add(new THREE.Mesh(new THREE.RingGeometry(R, R + 0.003, 64), flat(0xffd34d)));
+    const cols = [0xdfe6f0, 0xf7d9a8, 0xbfd8ff, 0xf3b6b6];
+    const bs = Array.from({ length: 16 }, (_, i) => {
+      const a = Math.random() * 6.28, d = Math.sqrt(Math.random()) * R * 0.72;
+      const w = 0.003 + Math.random() * 0.004;
+      const b = new THREE.Mesh(new THREE.BoxGeometry(w, w, 1).translate(0, 0, 0.5), solid(cols[i % 4]));
+      b.position.set(Math.cos(a) * d, Math.sin(a) * d, 0); b.userData = { h: 0.006 + Math.random() * 0.02, d: 0.4 + i * 0.07 };
+      b.scale.z = 1e-4; g.add(b); return b; });
+    const tag = label("¡una ciudad!", 0.02); tag.position.set(0, 0, 0.05); tag.visible = false; g.add(tag);
+    return { g, update(t) {
+      const sink = t > 8 ? clamp01(9 - t) : 1;
+      for (const b of bs) b.scale.z = Math.max(1e-4, b.userData.h * ease((t - b.userData.d) / 0.6) * sink);
+      tag.visible = t > 1.8 && t < 8.5;
+      return t < 9;
+    } };
+  },
+  "MONTES APENINOS": f => {               // the mountains rise; El Ávila beside them, about half as tall
+    const g = new THREE.Group();
+    const pts = (f.line || [f.pos]).map(p => new THREE.Vector2(p[0] - f.pos[0], p[1] - f.pos[1]));
+    const peaks = [];
+    for (let i = 0; i < pts.length - 1; i++) for (let k = 0; k < 3; k++) {
+      const p = pts[i].clone().lerp(pts[i + 1], k / 3);
+      const c = new THREE.Mesh(upCone(0.011 + Math.random() * 0.006, 7), solid(0xb9b4ad));
+      c.position.set(p.x + (Math.random() - 0.5) * 0.006, p.y + (Math.random() - 0.5) * 0.006, 0);
+      c.userData = { h: 0.055 + Math.random() * 0.03, d: 0.2 + peaks.length * 0.08 }; c.scale.z = 1e-4; g.add(c); peaks.push(c);
+    }
+    const end = pts[pts.length - 1];
+    const avila = new THREE.Mesh(upCone(0.016, 9), solid(0x3fae5a));
+    avila.position.set(end.x + 0.05, end.y - 0.03, 0); avila.scale.z = 1e-4; g.add(avila);
+    const tA = label("El Ávila", 0.024); tA.position.set(end.x + 0.05, end.y - 0.03, 0.06); tA.visible = false; g.add(tA);
+    const tM = label("Apeninos", 0.024); tM.position.set(0, 0, 0.1); tM.visible = false; g.add(tM);
+    return { g, update(t) {
+      const sink = t > 9 ? clamp01(10 - t) : 1;
+      for (const c of peaks) c.scale.z = Math.max(1e-4, c.userData.h * ease((t - c.userData.d) / 0.8) * sink);
+      avila.scale.z = Math.max(1e-4, 0.037 * ease((t - 2.6) / 0.8) * sink);
+      tM.visible = t > 1.5 && t < 9.5; tA.visible = t > 3 && t < 9.5;
+      return t < 10;
+    } };
+  },
+  "MAR DE LAS CRISIS": f => {             // a round sea, all alone at the edge: draw its outline
+    const g = new THREE.Group(), R = f.km * K, n = 36;
+    const dashes = Array.from({ length: n }, (_, i) => { const a = i / n * 6.28;
+      const d = new THREE.Mesh(new THREE.PlaneGeometry(R * 0.11, 0.0035), flat(0x6fe3ff, { opacity: 0 }));
+      d.position.set(Math.cos(a) * R, Math.sin(a) * R, 0.003); d.rotation.z = a + Math.PI / 2; g.add(d); return d; });
+    const fill = new THREE.Mesh(new THREE.CircleGeometry(R, 64), flat(0x6fe3ff, { opacity: 0 })); g.add(fill);
+    return { g, update(t) {
+      const fade = t > 7 ? clamp01(8 - t) : 1;
+      dashes.forEach((d, i) => d.material.opacity = (t * 18 > i ? 1 : 0) * fade);
+      fill.material.opacity = (t > 2 ? 0.12 + 0.08 * Math.sin(t * 3) : 0) * fade;
+      g.rotation.z = t * 0.15;
+      return t < 8;
+    } };
+  },
+  "MAR DE LA TRANQUILIDAD": () => {       // Apollo 11 lands, footprints, a flag
+    const g = new THREE.Group(), lander = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.016, 0.016, 0.01), solid(0xd9a441)); body.position.z = 0.012;
+    const cab = new THREE.Mesh(new THREE.CylinderGeometry(0.007, 0.009, 0.009, 6).rotateX(Math.PI / 2), solid(0xdadada)); cab.position.z = 0.022;
+    lander.add(body, cab);
+    for (const [sx, sy] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.0012, 0.0012, 0.015), solid(0xbbbbbb));
+      leg.position.set(sx * 0.0105, sy * 0.0105, 0.0065); leg.rotation.set(sy * 0.35, -sx * 0.35, 0); lander.add(leg);
+    }
+    const flame = new THREE.Mesh(upCone(0.005, 12).rotateX(Math.PI), flat(0xff9a3c, { opacity: 0.9, depthTest: true }));
+    flame.position.z = 0.007; lander.add(flame);
+    g.add(lander);
+    const dust = new THREE.Mesh(new THREE.RingGeometry(0.85, 1, 48), flat(0xdddddd, { opacity: 0 })); g.add(dust);
+    const steps = Array.from({ length: 12 }, (_, i) => {
+      const s = new THREE.Mesh(new THREE.CircleGeometry(1, 16), flat(0xbfe9ff, { opacity: 0 }));
+      const a = 0.3 + i * 0.12, d = 0.02 + i * 0.0045, side = i % 2 ? 1 : -1;
+      s.position.set(Math.cos(a) * d - Math.sin(a) * side * 0.002, Math.sin(a) * d + Math.cos(a) * side * 0.002, 0.002);
+      s.scale.set(0.0016, 0.0028, 1); s.rotation.z = a - Math.PI / 2; g.add(s); return s; });
+    const flag = new THREE.Group();
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.0006, 0.0006, 0.024).rotateX(Math.PI / 2).translate(0, 0, 0.012), solid(0xeeeeee));
+    const cloth = new THREE.Mesh(new THREE.PlaneGeometry(0.013, 0.008), new THREE.MeshStandardMaterial({ color: 0xffffff, side: THREE.DoubleSide }));
+    cloth.rotation.x = Math.PI / 2; cloth.position.set(0.0065, 0, 0.02);
+    flag.add(pole, cloth); flag.position.set(0.05, 0.048, 0); flag.scale.setScalar(1e-4); g.add(flag);
+    const tag = label("1969", 0.016); tag.position.set(0, 0, 0.055); tag.visible = false; g.add(tag);
+    return { g, update(t) {
+      lander.position.z = 0.28 * (1 - ease(t / 2.6));
+      flame.visible = t < 2.7; flame.scale.set(1, 1, 0.014 + 0.004 * Math.sin(t * 40));
+      const u = t - 2.6; dust.material.opacity = u > 0 ? clamp01(1 - u) * 0.7 : 0; dust.scale.setScalar(Math.max(1e-4, 0.01 + 0.035 * clamp01(u)));
+      steps.forEach((s, i) => s.material.opacity = t > 4 + i * 0.35 ? 0.9 : 0);
+      flag.scale.setScalar(Math.max(1e-4, ease((t - 8.6) / 0.5)));
+      tag.visible = t > 3;
+      return t < 14;
+    } };
+  },
+  "MAR DE LA FECUNDIDAD": () => {         // Luna 16 lands, scoops soil, flies it home
+    const g = new THREE.Group(), probe = new THREE.Group();
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.012, 0.008, 8).rotateX(Math.PI / 2), solid(0xc8c8c8)); base.position.z = 0.008;
+    const pod = new THREE.Mesh(new THREE.SphereGeometry(0.006, 16, 12), solid(0xe8e0c8)); pod.position.z = 0.017;
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.0012, 0.0012).translate(0.009, 0, 0), solid(0x999999)); arm.position.z = 0.012;
+    const soil = new THREE.Mesh(new THREE.SphereGeometry(0.0025, 10, 8), solid(0x6b5440)); soil.position.set(0.018, 0, 0); soil.visible = false; arm.add(soil);
+    const flame = new THREE.Mesh(upCone(0.004, 12).rotateX(Math.PI), flat(0xff9a3c, { opacity: 0.9, depthTest: true }));
+    flame.scale.z = 0.012;
+    probe.add(base, arm, pod, flame); g.add(probe);
+    const tag = label("robot Luna 16", 0.016); tag.position.set(0, 0, 0.05); tag.visible = false; g.add(tag);
+    return { g, update(t) {
+      probe.position.z = 0.25 * (1 - ease(t / 2.4));
+      flame.position.z = probe.position.z > 0.001 ? 0.004 : 0.012; flame.visible = t < 2.5 || t > 6.2;
+      arm.rotation.y = t > 3 && t < 6 ? -0.9 * Math.sin((t - 3) / 3 * Math.PI) : 0;
+      soil.visible = t > 4.4 && t < 6.2;
+      flame.scale.z = 0.012 + 0.004 * Math.sin(t * 40);
+      if (t > 6.2) { const u = t - 6.2; pod.position.z = 0.017 + 0.35 * u * u; flame.position.z = pod.position.z - 0.005; }
+      tag.visible = t > 2.4 && t < 9;
+      return t < 9;
+    } };
+  },
+};
+
+let active = null, clockNow = 0;
+function stopAnim() {
+  if (!active) return;
+  content.remove(active.g);
+  active.g.traverse(o => { o.geometry?.dispose(); if (o.material) { o.material.map?.dispose(); o.material.dispose(); } });
+  active = null;
+}
+function startAnim(m) {
+  stopAnim();
+  const make = FX[m.f.name]; if (!make) return;
+  active = make(m.f);
+  active.g.position.set(m.f.pos[0], m.f.pos[1], 0.003);
+  active.t0 = clockNow;
+  content.add(active.g);
 }
 
 let selected = null;
@@ -108,23 +319,24 @@ function select(m) {
   $("cname").textContent = m.f.name;
   $("ctext").textContent = m.f.text;
   $("card").classList.add("show");
-  say(m.f.name.toLowerCase() + ". " + m.f.say);
+  play("f" + m.i, m.f.name + ". " + m.f.say);
+  startAnim(m);
 }
 let factIdx = 0;
-$("fact").onclick = () => {
-  const t = data.facts[factIdx++ % data.facts.length];
+$("fact").addEventListener("click", () => {
+  const i = factIdx++ % data.facts.length, t = data.facts[i];
   $("cname").textContent = "¿Sabías que…?";
   $("ctext").textContent = t;
   $("card").classList.add("show");
-  say("¿Sabías que " + t.charAt(0).toLowerCase() + t.slice(1));
-};
-$("card").onclick = () => { $("card").classList.remove("show"); selected = null; speechSynthesis.cancel(); };
+  play("fact" + i, t);
+});
+$("card").addEventListener("click", () => { $("card").classList.remove("show"); selected = null; hush(); stopAnim(); });
 
 // ---------- renderer: real AR, or a demo with the drawing on screen ----------
 let renderer, scene, camera, startAR;
 if (DEMO) {
   renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   $("stage").appendChild(renderer.domElement);
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0d1220);
@@ -136,8 +348,14 @@ if (DEMO) {
   const fit = () => {
     const w = innerWidth, h = innerHeight;
     renderer.setSize(w, h); camera.aspect = w / h;
-    const need = Math.max(data.aspect, 1 / camera.aspect) * 1.1;   // fit the sheet
-    camera.position.set(0, 0, need / 2 / Math.tan(THREE.MathUtils.degToRad(20)));
+    // landscape: show the whole sheet; upright phone: zoom in on the moon
+    const portrait = camera.aspect < 1;
+    const span = portrait ? data.moon.r * 2.5 : 1.05;
+    const need = Math.max(portrait ? span : data.aspect * 1.05, span / camera.aspect);
+    const d = need / 2 / Math.tan(THREE.MathUtils.degToRad(20));
+    const c = portrait ? data.moon.pos : [0, 0];
+    camera.position.set(c[0], c[1] - d * 0.55, d * 0.85);     // tilted, as if holding the phone over the sheet
+    camera.lookAt(c[0], c[1], 0);
     camera.updateProjectionMatrix();
   };
   addEventListener("resize", fit); fit();
@@ -154,10 +372,10 @@ if (DEMO) {
   startAR = async () => { await mind.start(); $("hint").style.opacity = 1; };
 }
 
-// ---------- taps ----------
+// ---------- taps (click, so iPhone lets the tap start sound) ----------
 const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
 renderer.domElement.style.touchAction = "none";
-$("stage").addEventListener("pointerdown", e => {
+$("stage").addEventListener("click", e => {
   const rect = renderer.domElement.getBoundingClientRect();
   ndc.set((e.clientX - rect.left) / rect.width * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
   ray.setFromCamera(ndc, camera);
@@ -168,27 +386,30 @@ $("stage").addEventListener("pointerdown", e => {
 // ---------- loop ----------
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
-  const t = clock.getElapsedTime();
+  const t = clockNow = clock.getElapsedTime();
   for (const m of marks) {
     const s = m === selected ? 1.35 + 0.08 * Math.sin(t * 6) : 1 + 0.12 * Math.sin(t * 2.2 + m.phase);
     m.g.scale.setScalar(s);
-    m.glow.material.opacity = m === selected ? 0.35 : 0.12 + 0.1 * Math.sin(t * 2.2 + m.phase);
+    const dim = active && m !== selected ? 0.4 : 1;          // other rings step back while a scene plays
+    m.ring.material.opacity = 0.95 * dim;
+    m.glow.material.opacity = (m === selected ? 0.35 : 0.12 + 0.1 * Math.sin(t * 2.2 + m.phase)) * dim;
   }
+  if (active && active.update(t - active.t0) === false) stopAnim();
   renderer.render(scene, camera);
 });
 
-$("go").onclick = async () => {
-  say("¡Hola! Toca los círculos para descubrir la Luna.");   // first speech inside a tap unlocks audio on iPhone
+$("go").addEventListener("click", async () => {
+  play("hola", "¡Hola! Toca los círculos para descubrir la Luna.");   // first sound inside a tap unlocks audio on iPhone
   $("start").remove();
   if (DEMO) $("fact").style.display = "";
   try { await startAR(); }
   catch (err) {
-    $("hint").innerHTML = "No pude abrir la cámara 📷. Revisa el permiso de la cámara, o prueba el " +
+    $("hint").innerHTML = "No pude abrir la cámara 📷. En el iPhone: Ajustes › Safari › Cámara › Permitir. O prueba el " +
       '<a href="?demo" style="color:var(--accent)">modo sin cámara</a>.';
     $("hint").style.opacity = 1;
     console.warn("camera:", err);
   }
-};
+});
 window.__moon = { marks, select, data };
 </script>
 </body>
