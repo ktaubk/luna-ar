@@ -1,6 +1,6 @@
 # La Luna AR
 
-Point a phone at the printed star-chart moon and tap the glowing rings: each one names a lunar feature and reads a fact out loud, in Spanish.
+Point a phone at the plotted white-on-grey moon map and tap the glowing rings: each one names a lunar feature and reads a fact out loud, in Spanish.
 
 - Live: https://ktaubk.github.io/luna-ar/ — no camera? add `?demo`
 - Built with [MindAR](https://github.com/hiukim/mind-ar-js) + three.js; moon tone from NASA's LRO map (public domain).
