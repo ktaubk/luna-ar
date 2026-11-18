@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>La Luna AR</title>
+<style>
+  :root { --bg: #0d1220; --ink: #f4f1e8; --accent: #ffd34d; --ring: #6fe3ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden;
+    font: 18px/1.35 ui-rounded, "SF Pro Rounded", system-ui, sans-serif; -webkit-user-select: none; user-select: none; }
+  #stage { position: fixed; inset: 0; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px;
+    background: radial-gradient(circle at 50% 40%, #1d2a4a, var(--bg)); z-index: 10; }
+  #start h1 { font-size: 44px; margin: 0 0 8px; letter-spacing: 1px; }
+  #start p { margin: 0 0 28px; opacity: .85; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 14px 26px; background: var(--accent); color: #1a1400;
+    font-weight: 700; box-shadow: 0 4px 0 #b8901f; }
+  button:active { transform: translateY(2px); box-shadow: 0 2px 0 #b8901f; }
+  #hint { position: fixed; top: max(16px, env(safe-area-inset-top)); left: 16px; right: 16px; text-align: center; z-index: 5;
+    background: rgba(13,18,32,.72); padding: 10px 14px; border-radius: 14px; transition: opacity .4s; }
+  #card { position: fixed; left: 12px; right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); z-index: 5;
+    background: rgba(13,18,32,.88); border: 2px solid var(--accent); border-radius: 20px; padding: 14px 18px 16px;
+    transform: translateY(140%); transition: transform .35s cubic-bezier(.2,.9,.3,1.2); }
+  #card.show { transform: none; }
+  #card h2 { margin: 0 0 4px; font-size: 22px; color: var(--accent); }
+  #card p { margin: 0; }
+  #fact { position: fixed; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); z-index: 4; }
+  #card.show ~ #fact { opacity: 0; pointer-events: none; }
+  .mindar-ui-overlay { display: none !important; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+} }
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="start">
+  <div>
+    <h1>🌕 La Luna</h1>
+    <p>Apunta el teléfono al dibujo de la Luna<br>y toca los círculos que brillan.</p>
+    <button id="go">¡Empezar!</button>
+  </div>
+</div>
+<div id="hint" style="opacity:0">Apunta al dibujo de la Luna 🔭</div>
+<div id="card"><h2 id="cname"></h2><p id="ctext"></p></div>
+<button id="fact" style="display:none">¿Sabías que…?</button>
+
+<script type="module">
+import * as THREE from "three";
+
+const DEMO = new URLSearchParams(location.search).has("demo");
+const data = await (await fetch("features.json")).json();
+const $ = id => document.getElementById(id);
+
+// ---------- voice (Spanish) ----------
+let voice = null;
+function pickVoice() {
+  const vs = speechSynthesis.getVoices().filter(v => v.lang.toLowerCase().startsWith("es"));
+  const pref = ["es-VE", "es-419", "es-US", "es-MX", "es-CO", "es-ES"];
+  const odd = /eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley|bad|bahh|bells|boing|bubbles|cellos|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|fred|junior|kathy|ralph/i;
+  const nice = vs.filter(v => !odd.test(v.name));
+  const named = ["Paulina", "Mónica", "Monica", "Google español de Estados Unidos", "Google español"]
+    .map(n => nice.find(v => v.name.startsWith(n))).find(Boolean);
+  voice = named || pref.map(p => nice.find(v => v.lang.replace("_", "-") === p)).find(Boolean) || nice[0] || vs[0] || null;
+}
+pickVoice();
+speechSynthesis.onvoiceschanged = pickVoice;
+function say(text) {
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = voice ? voice.lang : "es-ES";
+  if (voice) u.voice = voice;
+  u.rate = 0.92; u.pitch = 1.08;
+  speechSynthesis.speak(u);
+}
+
+// ---------- the content pinned to the drawing ----------
+const content = new THREE.Group();
+const marks = [];
+for (const f of data.features) {
+  const g = new THREE.Group();
+  g.position.set(f.pos[0], f.pos[1], 0.002);
+  const r = Math.max(f.r, 0.012);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(r, r + 0.004, 48),
+    new THREE.MeshBasicMaterial({ color: 0x6fe3ff, transparent: true, opacity: 0.95, depthTest: false }));
+  const glow = new THREE.Mesh(new THREE.CircleGeometry(r + 0.012, 48),
+    new THREE.MeshBasicMaterial({ color: 0x6fe3ff, transparent: true, opacity: 0.18, depthTest: false }));
+  const hit = new THREE.Mesh(new THREE.CircleGeometry(Math.max(r + 0.02, 0.035), 24),
+    new THREE.MeshBasicMaterial({ visible: false }));
+  hit.userData.f = f;
+  g.add(glow, ring, hit);
+  content.add(g);
+  marks.push({ f, g, ring, glow, hit, phase: Math.random() * 6.28 });
+}
+
+let selected = null;
+function select(m) {
+  selected = m;
+  for (const k of marks) {
+    const on = k === m;
+    k.ring.material.color.set(on ? 0xffd34d : 0x6fe3ff);
+    k.glow.material.color.set(on ? 0xffd34d : 0x6fe3ff);
+  }
+  $("cname").textContent = m.f.name;
+  $("ctext").textContent = m.f.text;
+  $("card").classList.add("show");
+  say(m.f.name.toLowerCase() + ". " + m.f.say);
+}
+let factIdx = 0;
+$("fact").onclick = () => {
+  const t = data.facts[factIdx++ % data.facts.length];
+  $("cname").textContent = "¿Sabías que…?";
+  $("ctext").textContent = t;
+  $("card").classList.add("show");
+  say("¿Sabías que " + t.charAt(0).toLowerCase() + t.slice(1));
+};
+$("card").onclick = () => { $("card").classList.remove("show"); selected = null; speechSynthesis.cancel(); };
+
+// ---------- renderer: real AR, or a demo with the drawing on screen ----------
+let renderer, scene, camera, startAR;
+if (DEMO) {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  $("stage").appendChild(renderer.domElement);
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d1220);
+  camera = new THREE.PerspectiveCamera(40, 1, 0.01, 10);
+  const tex = new THREE.TextureLoader().load("target.png");
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const paper = new THREE.Mesh(new THREE.PlaneGeometry(1, data.aspect), new THREE.MeshBasicMaterial({ map: tex }));
+  scene.add(paper, content);
+  const fit = () => {
+    const w = innerWidth, h = innerHeight;
+    renderer.setSize(w, h); camera.aspect = w / h;
+    const need = Math.max(data.aspect, 1 / camera.aspect) * 1.1;   // fit the sheet
+    camera.position.set(0, 0, need / 2 / Math.tan(THREE.MathUtils.degToRad(20)));
+    camera.updateProjectionMatrix();
+  };
+  addEventListener("resize", fit); fit();
+  startAR = async () => {};
+} else {
+  const { MindARThree } = await import("mindar-image-three");
+  const mind = new MindARThree({ container: $("stage"), imageTargetSrc: "target.mind",
+    uiLoading: "no", uiScanning: "no", uiError: "yes", filterMinCF: 0.0001, filterBeta: 0.001 });
+  ({ renderer, scene, camera } = mind);
+  const anchor = mind.addAnchor(0);
+  anchor.group.add(content);
+  anchor.onTargetFound = () => { $("hint").style.opacity = 0; $("fact").style.display = ""; };
+  anchor.onTargetLost = () => { $("hint").style.opacity = 1; };
+  startAR = async () => { await mind.start(); $("hint").style.opacity = 1; };
+}
+
+// ---------- taps ----------
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+renderer.domElement.style.touchAction = "none";
+$("stage").addEventListener("pointerdown", e => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.set((e.clientX - rect.left) / rect.width * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObjects(marks.map(m => m.hit), false)[0];
+  if (hit) select(marks.find(m => m.hit === hit.object));
+});
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  for (const m of marks) {
+    const s = m === selected ? 1.35 + 0.08 * Math.sin(t * 6) : 1 + 0.12 * Math.sin(t * 2.2 + m.phase);
+    m.g.scale.setScalar(s);
+    m.glow.material.opacity = m === selected ? 0.35 : 0.12 + 0.1 * Math.sin(t * 2.2 + m.phase);
+  }
+  renderer.render(scene, camera);
+});
+
+$("go").onclick = async () => {
+  say("¡Hola! Toca los círculos para descubrir la Luna.");   // first speech inside a tap unlocks audio on iPhone
+  $("start").remove();
+  if (DEMO) $("fact").style.display = "";
+  try { await startAR(); }
+  catch (err) {
+    $("hint").innerHTML = "No pude abrir la cámara 📷. Revisa el permiso de la cámara, o prueba el " +
+      '<a href="?demo" style="color:var(--accent)">modo sin cámara</a>.';
+    $("hint").style.opacity = 1;
+    console.warn("camera:", err);
+  }
+};
+window.__moon = { marks, select, data };
+</script>
+</body>
+</html>
